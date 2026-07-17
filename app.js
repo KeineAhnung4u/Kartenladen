@@ -14,7 +14,6 @@ let priceSuggestions = [];
 let priceSuggestionsLoading = false;
 let priceSuggestionTimer = null;
 let renderTimer = null;
-let saveTimer = null;
 let githubSyncTimer = null;
 let githubSyncing = false;
 
@@ -24,7 +23,7 @@ let searchState = {
   ankauf: '', ankaufSet: '', ankaufType: '', ankaufRarity: '', ankaufSubtype: '',
   preiseName: '', preiseSet: '', preiseType: '', preiseRarity: '', preiseSubtype: '',
 };
-let apiFilterOptions = { sets: [], types: [], subtypes: [], rarities: [], supertypes: [] };
+let apiFilterOptions = { sets: [], types: [], subtypes: [], rarities: [] };
 let priceSearchTimer = null;
 let priceRequestController = null;
 let priceRequestSequence = 0;
@@ -74,11 +73,11 @@ async function githubGetFile() {
       'X-GitHub-Api-Version': '2022-11-28'
     }
   });
-  if (res.status === 404) return { sha: null, content: null };
-  if (!res.ok) throw new Error(`GitHub ${res.status}`);
+  if (res.status === 404) return { exists: false, sha: null, content: null };
+  if (!res.ok) throw new Error(`GitHub GET ${res.status}`);
   const data = await res.json();
   const decoded = atob(data.content.replace(/\n/g, ''));
-  return { sha: data.sha, content: decoded };
+  return { exists: true, sha: data.sha, content: decoded };
 }
 
 async function githubPutFile(content, sha) {
@@ -100,7 +99,11 @@ async function githubPutFile(content, sha) {
     },
     body: JSON.stringify(body)
   });
-  if (!res.ok) throw new Error(`GitHub ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`GitHub PUT ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return true;
 }
 
@@ -109,7 +112,7 @@ async function syncFromGithub() {
   try {
     updateSyncStatus('syncing', '⏳ Lade...');
     const file = await githubGetFile();
-    if (file && file.content) {
+    if (file && file.exists && file.content) {
       const remote = JSON.parse(file.content);
       state = remote;
       localStorage.setItem(KEY, JSON.stringify(state));
@@ -134,19 +137,29 @@ async function syncFromGithub() {
 async function syncToGithub() {
   if (!isGithubConfigured() || githubSyncing) return;
   githubSyncing = true;
+  const MAX_RETRIES = 3;
   try {
     updateSyncStatus('syncing', '⏳ Speichere...');
     const content = JSON.stringify(state);
-    let sha = null;
-    try {
-      const file = await githubGetFile();
-      sha = file ? file.sha : null;
-    } catch (e) {}
-    await githubPutFile(content, sha);
-    githubConfig.lastSync = new Date().toISOString();
-    githubConfig.lastError = null;
-    saveGithubConfig();
-    updateSyncStatus('ok', `✓ ${new Date().toLocaleTimeString('de-DE')}`);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const file = await githubGetFile();
+        const sha = file && file.exists ? file.sha : null;
+        await githubPutFile(content, sha);
+        githubConfig.lastSync = new Date().toISOString();
+        githubConfig.lastError = null;
+        saveGithubConfig();
+        updateSyncStatus('ok', `✓ ${new Date().toLocaleTimeString('de-DE')}`);
+        return;
+      } catch (e) {
+        if (e.status === 409 && attempt < MAX_RETRIES) {
+          console.warn(`GitHub 409 - Retry ${attempt}/${MAX_RETRIES}`);
+          await new Promise(r => setTimeout(r, 500 * attempt));
+          continue;
+        }
+        throw e;
+      }
+    }
   } catch (e) {
     console.error('GitHub Save Error:', e);
     githubConfig.lastError = e.message;
@@ -163,7 +176,7 @@ function scheduleGithubSync() {
   githubSyncTimer = setTimeout(syncToGithub, 1500);
 }
 
-// ============ LOCAL SAVE (SCHNELL!) ============
+// ============ LOCAL SAVE ============
 function save() {
   try {
     localStorage.setItem(KEY, JSON.stringify(state));
@@ -295,27 +308,21 @@ function updateItemField(id, field, value) {
   save();
 }
 
-// 🌟 FIX: Ankauf-Funktion komplett repariert
 function addPurchase(form) {
   const name = form.pname.value.trim();
   if (!name) return;
   const qty = parseInt(form.pqty.value) || 1;
   const price = parseFloat(form.pprice.value) || 0;
   const tags = getFilterTagsFromForm(form);
-  
   state.purchases.push({
     id: uid(), date: todayStr(), name, qty, pricePaid: price,
     set: tags.set, type: tags.type, rarity: tags.rarity, subtype: tags.subtype
   });
-  
-  // ✅ FIX: Sichere Checkbox-Prüfung
   const addToStockCheckbox = form.elements.namedItem('addToStock');
   const shouldAddToStock = addToStockCheckbox && addToStockCheckbox.checked;
-  
   if (shouldAddToStock) {
     const normalizedName = name.toLowerCase();
     let existing = state.items.find(i => i.name.toLowerCase() === normalizedName);
-    
     if (existing) {
       existing.qty += qty;
       if (price > 0) existing.buyPrice = price / qty;
@@ -326,24 +333,14 @@ function addPurchase(form) {
         subtype: (existing.filterTags && existing.filterTags.subtype) || tags.subtype
       };
     } else {
-      // ✅ FIX: filterTags ohne Leerzeichen
       state.items.push({
-        id: uid(),
-        name: name,
-        category: form.pcategory.value,
-        qty: qty,
-        buyPrice: price > 0 ? price / qty : 0,
-        sellPrice: 0,
-        set: tags.set,
-        type: tags.type,
-        rarity: tags.rarity,
-        subtype: tags.subtype,
+        id: uid(), name, category: form.pcategory.value, qty,
+        buyPrice: price > 0 ? price / qty : 0, sellPrice: 0,
+        set: tags.set, type: tags.type, rarity: tags.rarity, subtype: tags.subtype,
         filterTags: tags
       });
     }
   }
-  
-  // ✅ FIX: save() ist jetzt synchron → sofort fertig
   save();
   form.reset();
   selectedCardForImport = null;
@@ -672,10 +669,6 @@ function render() {
   }
 }
 
-function labelFor(v) {
-  return { kasse: '🛒 Kasse', lager: '📦 Lager', ankauf: '💰 Ankauf', statistik: '📊 Statistik', preise: '🃏 Preise', settings: '⚙ Sync' }[v];
-}
-
 function renderKasse() {
   const available = state.items.filter(i => i.qty > 0);
   const filtered = filterItems(available, searchState.kasse, searchState.kasseCategory, {
@@ -742,7 +735,7 @@ function renderLager() {
     <h2>Neuer Artikel</h2>
     <form id="addItemForm">
       <div class="row">
-        <div class="field"><label>Name</label><input name="name" placeholder="z.B. Charizard ex 199/197" required></div>
+        <div class="field"><label>Name</label><input name="name" required></div>
         <div class="field" style="max-width:160px;"><label>Kat.</label>
           <select name="category"><option value="sealed">Sealed</option><option value="single">Einzelkarte</option><option value="merch">Merch</option></select>
         </div>
@@ -762,8 +755,8 @@ function renderLager() {
   <div class="card">
     <h2>Backup</h2>
     <div class="row" style="margin-bottom:12px;">
-      <button type="button" id="exportBackupBtn" class="btn-gold">Backup exportieren</button>
-      <button type="button" id="importBackupBtn" class="btn-red">Backup importieren</button>
+      <button type="button" id="exportBackupBtn" class="btn-gold">Export</button>
+      <button type="button" id="importBackupBtn" class="btn-red">Import</button>
       <input type="file" id="backupImportInput" accept=".txt,text/plain" style="display:none;">
     </div>
   </div>
@@ -816,11 +809,11 @@ function renderAnkauf() {
   });
   return `
   <div class="card">
-    <h2>Ankauf erfassen</h2>
+    <h2>Ankauf</h2>
     <form id="addPurchaseForm">
       <div class="row">
-        <div class="field"><label>Name</label><input name="pname" placeholder="z.B. Pikachu VMAX" value="${esc(prefilledName)}" required></div>
-        <div class="field" style="max-width:160px;"><label>Kategorie</label>
+        <div class="field"><label>Name</label><input name="pname" value="${esc(prefilledName)}" required></div>
+        <div class="field" style="max-width:160px;"><label>Kat.</label>
           <select name="pcategory"><option value="single">Einzelkarte</option><option value="sealed">Sealed</option><option value="merch">Merch</option></select>
         </div>
         <div class="field" style="max-width:100px;"><label>Menge</label><input name="pqty" type="number" min="1" value="1"></div>
@@ -929,7 +922,7 @@ function addCardToPurchase(card) {
   showToast('In Ankauf übernommen');
 }
 
-function renderFilterSelect(name, value, options, placeholder = 'Wähle…', filterKey = null) {
+function renderFilterSelect(name, value, options, placeholder, filterKey) {
   const selected = String(value || '').trim();
   const key = filterKey || name.toLowerCase();
   return `<div class="field"><label>${esc(name)}</label><select class="search-input" data-price-filter="${esc(key)}"><option value="">${esc(placeholder)}</option>${options.map(opt => `<option value="${esc(opt)}" ${selected === opt ? 'selected' : ''}>${esc(opt)}</option>`).join('')}</select></div>`;
@@ -937,7 +930,7 @@ function renderFilterSelect(name, value, options, placeholder = 'Wähle…', fil
 
 function renderPreise() {
   let resultsHtml = '';
-  if (priceLoading) resultsHtml = '<div class="empty">Suche läuft…</div>';
+  if (priceLoading) resultsHtml = '<div class="empty">Suche...</div>';
   else if (priceResults === 'error') resultsHtml = `<div class="empty">${esc(priceErrorMessage)}</div>`;
   else if (Array.isArray(priceResults)) {
     if (priceResults.length === 0) resultsHtml = `<div class="empty">Keine Treffer für "${esc(priceQuery)}".</div>`;
@@ -977,16 +970,16 @@ function renderPreise() {
   }
   const suggestionsHtml = priceSuggestions.length === 0 && !priceSuggestionsLoading ? '' :
     `<div class="price-suggestions">
-      ${priceSuggestionsLoading ? '<div class="suggestion-row muted">Lädt…</div>' : ''}
+      ${priceSuggestionsLoading ? '<div class="suggestion-row muted">Lädt...</div>' : ''}
       ${priceSuggestions.map(s => `<button type="button" class="suggestion-row" data-price-suggestion="${esc(s.name)}"><div>${esc(s.name)}</div><div class="suggestion-meta">${esc(s.set || '')}</div></button>`).join('')}
     </div>`;
   return `
   <div class="card">
-    <h2>Karten suchen</h2>
+    <h2>Preise</h2>
     <form id="priceForm" class="row">
       <div class="field" style="position:relative;flex:2;">
         <label>Kartenname</label>
-        <input name="q" value="${esc(searchState.preiseName)}" placeholder="z.B. Charizard VMAX Evolving Skies" required>
+        <input name="q" value="${esc(searchState.preiseName)}" required>
         ${suggestionsHtml}
       </div>
       <button type="submit" class="btn-gold">Suchen</button>
@@ -1005,9 +998,6 @@ function renderSettings() {
   return `
   <div class="card">
     <h2>GitHub Sync</h2>
-    <div class="settings-info">
-      Daten werden automatisch auf GitHub gespeichert. Token: <code>github.com/settings/tokens</code> → "Generate new token (classic)" → Scope <code>repo</code>.
-    </div>
     <form id="githubForm">
       <div class="row">
         <div class="field"><label>Username</label><input name="user" value="${esc(githubConfig.user)}"></div>
